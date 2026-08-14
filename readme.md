@@ -1,5 +1,7 @@
 # CTI File Parser
 
+Paper-inspired CTI extraction and retrieval project based on the ideas and corpus framing of the AnnoCTR research work.
+
 A cyber threat intelligence (CTI) text parsing project that combines:
 
 - a spaCy-based NER pipeline for entity extraction from CTI reports
@@ -13,6 +15,22 @@ This project is designed to help with CTI report workflows such as:
 - extracting entities such as malware, groups, organizations, tools, tactics, dates, and locations
 
 ---
+
+## Research reference
+
+This project is inspired by the AnnoCTR research work on CTI report annotation and extraction:
+
+- Repository: https://github.com/boschresearch/anno-ctr-lrec-coling-2024
+- Project: AnnoCTR: CTI Report and Annotation Corpus for Threat Intelligence Extraction
+
+This repo is a paper-inspired implementation built around the same CTI corpus and extraction philosophy, adapted for a local parser + retrieval workflow.
+
+Suggested citation format:
+
+```text
+AnnoCTR: CTI Report and Annotation Corpus for Threat Intelligence Extraction.
+https://github.com/boschresearch/anno-ctr-lrec-coling-2024
+```
 
 ## Project structure
 
