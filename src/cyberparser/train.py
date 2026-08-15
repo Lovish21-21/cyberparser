@@ -1,6 +1,9 @@
 import json
 import random
 import re
+import subprocess
+import sys
+import time
 from collections import OrderedDict
 from itertools import product
 from pathlib import Path
@@ -9,19 +12,26 @@ import spacy
 from spacy.util import minibatch
 
 try:
-    from .preprocessing import build_training_examples, collect_entity_labels, ensure_model_directory, load_jsonl
+    from .preprocessing import (
+        build_training_examples,
+        collect_entity_labels,
+        ensure_model_directory,
+        load_jsonl,
+        prepare_spacy_corpus,
+    )
 except ImportError:  # pragma: no cover
-    from preprocessing import build_training_examples, collect_entity_labels, ensure_model_directory, load_jsonl
+    from preprocessing import (
+        build_training_examples,
+        collect_entity_labels,
+        ensure_model_directory,
+        load_jsonl,
+        prepare_spacy_corpus,
+    )
 
 
 def get_default_hyperparameter_grid():
     return [
-        {"n_iter": 5, "dropout": 0.1, "batch_size": 4},
-        {"n_iter": 5, "dropout": 0.2, "batch_size": 8},
-        {"n_iter": 10, "dropout": 0.1, "batch_size": 8},
-        {"n_iter": 10, "dropout": 0.2, "batch_size": 8},
-        {"n_iter": 20, "dropout": 0.1, "batch_size": 8},
-        {"n_iter": 20, "dropout": 0.2, "batch_size": 8},
+        {"n_iter": 10, "dropout": 0.2, "batch_size": 16},
     ]
 
 
@@ -37,12 +47,25 @@ def _train_single_config(train_examples, dev_examples, labels, n_iter, dropout, 
     for label in labels:
         ner.add_label(label)
 
-    optimizer = nlp.begin_training()
+    optimizer = nlp.initialize()
     for epoch in range(n_iter):
+        epoch_start = time.time()
         random.shuffle(train_examples)
         losses = {}
-        for batch in minibatch(train_examples, size=batch_size):
+        batches = list(minibatch(train_examples, size=batch_size))
+        total_batches = len(batches)
+        for i, batch in enumerate(batches):
             nlp.update(batch, sgd=optimizer, losses=losses, drop=dropout)
+            if (i + 1) % 10 == 0 or (i + 1) == total_batches:
+                print(f"[TIMING]   epoch {epoch + 1}: batch {i + 1}/{total_batches}", flush=True)
+        epoch_time = time.time() - epoch_start
+        ner_loss = losses.get("ner", 0.0)
+        print(
+            f"[TIMING] epoch {epoch + 1}/{n_iter} took {epoch_time:.1f}s "
+            f"(ner_loss={ner_loss:.2f}) -- est. remaining: "
+            f"{epoch_time * (n_iter - epoch - 1) / 60:.1f} min",
+            flush=True,
+        )
 
     if dev_examples:
         metrics = nlp.evaluate(dev_examples)
@@ -69,20 +92,38 @@ def _train_single_config(train_examples, dev_examples, labels, n_iter, dropout, 
     }
 
 
-def train_spacy_ner(train_path, dev_path=None, output_dir="models/cti_spacy_ner", n_iter=20, dropout=0.2, batch_size=8, hyperparameter_grid=None):
+def train_spacy_ner(train_path, dev_path=None, output_dir="models/cti_spacy_ner", n_iter=20, dropout=0.2, batch_size=8, hyperparameter_grid=None, limit=None):
+    spacy.require_cpu()
+    print("[INFO] spaCy training device: CPU")
+
     train_records = load_jsonl(train_path)
+    if limit:
+        train_records = train_records[:limit]
+        print(f"[INFO] --limit set: using only {len(train_records)} training records")
     labels = collect_entity_labels(train_records)
     print(f"[INFO] Loaded {len(train_records)} training records")
     print(f"[INFO] Labels: {labels}")
 
+    token_counts = [len(r.get("tokens") or []) for r in train_records]
+    if token_counts:
+        print(
+            f"[INFO] Record token counts -- max: {max(token_counts)}, "
+            f"avg: {sum(token_counts) / len(token_counts):.1f}, "
+            f"records over 500 tokens: {sum(1 for c in token_counts if c > 500)}"
+        )
+
     nlp = spacy.blank("en")
+    t0 = time.time()
     train_examples = build_training_examples(train_records, nlp)
-    print(f"[INFO] Generated {len(train_examples)} training examples")
+    print(f"[TIMING] Built {len(train_examples)} training examples in {time.time() - t0:.1f}s", flush=True)
 
     if dev_path:
         dev_records = load_jsonl(dev_path)
+        if limit:
+            dev_records = dev_records[:limit]
+        t0 = time.time()
         dev_examples = build_training_examples(dev_records, nlp)
-        print(f"[INFO] Loaded {len(dev_examples)} dev examples")
+        print(f"[TIMING] Built {len(dev_examples)} dev examples in {time.time() - t0:.1f}s")
     else:
         dev_examples = train_examples[: min(500, len(train_examples))]
 
@@ -135,6 +176,37 @@ def train_spacy_ner(train_path, dev_path=None, output_dir="models/cti_spacy_ner"
     best_metadata.pop("config", None)
 
     return best_model, best_metadata
+
+
+def train_spacy_cli(train_path, dev_path=None, config_path="models/cti_spacy_ner/config.cfg", output_dir="models/cti_spacy_ner/output"):
+    spacy.require_cpu()
+    print("[INFO] spaCy CLI training device: CPU")
+
+    corpus_dir = Path(config_path).resolve().parent / "corpus"
+    corpus = prepare_spacy_corpus(train_path, dev_path, str(corpus_dir))
+
+    train_path_abs = str(Path(corpus["train_path"]).resolve())
+    dev_path_abs = str(Path(corpus["dev_path"]).resolve()) if corpus.get("dev_path") else None
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "spacy",
+        "train",
+        str(Path(config_path).resolve()),
+        "--gpu-id",
+        "-1",
+        "--output",
+        str(Path(output_dir).resolve()),
+        "--paths.train",
+        train_path_abs,
+    ]
+    if dev_path_abs:
+        cmd.extend(["--paths.dev", dev_path_abs])
+
+    print(f"[INFO] Running spaCy CLI training: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    return corpus
 
 
 def normalize_entity_key(label):
