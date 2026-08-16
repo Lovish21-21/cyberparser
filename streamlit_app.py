@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -11,67 +10,41 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from cybersearch.corpus import Document, load_documents
-from cybersearch.index import SearchIndex
+# These imports must come AFTER the sys.path insert above, since `cybersearch`
+# and `cyberparser` live under src/ and aren't importable until that path is added.
+from cybersearch.engine import TfidfSearchEngine
 from cyberparser.train import parse_text_to_dict, train_spacy_ner
-
 
 DATASET_TEXT_ROOT = PROJECT_ROOT / "dataset" / "text"
 DATASET_TRAIN = PROJECT_ROOT / "dataset" / "train_ext.json"
 DATASET_DEV = PROJECT_ROOT / "dataset" / "dev.json"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "cti_spacy_ner"
-
-
-@st.cache_data
-def build_search_documents(train_path: str | Path):
-    path = Path(train_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Training data not found: {path}")
-
-    records = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                st.warning(f"Skipped malformed JSON at line {line_number}: {exc}")
-                continue
-            text = payload.get("text") or " ".join(payload.get("tokens") or [])
-            if not text or not text.strip():
-                continue
-            doc_id = payload.get("id") or f"record_{line_number}"
-            records.append(
-                Document(
-                    doc_id=str(doc_id),
-                    split=path.stem,
-                    filename=path.name,
-                    relative_path=path.name,
-                    title=(text[:120].strip() or path.stem),
-                    text=text,
-                )
-            )
-
-    return records
-
-
-@st.cache_data
-def load_text_corpus(text_root: str | Path):
-    root = Path(text_root)
-    if not root.exists():
-        return []
-    return load_documents(root)
+DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
 
 
 @st.cache_resource
-def load_or_train_model(model_dir: str | Path, train_path: str | Path, dev_path: str | Path):
+def load_search_engine(text_root: str | Path, artifact_dir: str | Path):
+    text_root = Path(text_root)
+    artifact_dir = Path(artifact_dir)
+
+    if (artifact_dir / "vectorizer.pkl").exists() and (artifact_dir / "matrix.pkl").exists():
+        return TfidfSearchEngine.from_artifacts(artifact_dir)
+
+    if not text_root.exists():
+        raise FileNotFoundError(f"Text corpus root not found: {text_root}")
+
+    engine = TfidfSearchEngine.from_text_root(text_root)
+    engine.save(artifact_dir)
+    return engine
+
+
+@st.cache_resource
+def load_or_train_model(model_dir: str | Path, train_path: str | Path, dev_path: str | Path, force_retrain: bool = False):
     model_dir = Path(model_dir)
     train_path = Path(train_path)
     dev_path = Path(dev_path)
 
-    if model_dir.exists():
+    if model_dir.exists() and not force_retrain:
         try:
             import spacy
 
@@ -93,22 +66,6 @@ def load_or_train_model(model_dir: str | Path, train_path: str | Path, dev_path:
     return model
 
 
-@st.cache_data
-def search_best_matches(query: str, text_root: str | Path, top_k: int = 5):
-    if not query or not query.strip():
-        return []
-
-    docs = load_text_corpus(text_root)
-    if not docs:
-        docs = build_search_documents(DATASET_TRAIN)
-
-    if not docs:
-        return []
-
-    index = SearchIndex.build(docs)
-    return index.search(query, top_k=top_k)
-
-
 st.set_page_config(page_title="CTI Search + Parser", page_icon="🛡️", layout="wide")
 
 st.title("CTI Search + Entity Parser")
@@ -126,6 +83,7 @@ with st.sidebar:
     train_path = st.text_input("Training JSONL", value=str(DATASET_TRAIN))
     dev_path = st.text_input("Dev JSONL", value=str(DATASET_DEV))
     model_dir = st.text_input("Model output directory", value=str(DEFAULT_MODEL_DIR))
+    force_retrain = st.checkbox("Force retrain model", value=False, help="Retrain from train/dev JSONL even if a saved model already exists.")
 
 if st.button("Search and parse best match", type="primary"):
     if not query.strip():
@@ -133,13 +91,19 @@ if st.button("Search and parse best match", type="primary"):
         st.stop()
 
     with st.spinner("Searching related CTI records and parsing the best match..."):
-        hits = search_best_matches(query, text_root=text_root, top_k=top_k)
+        try:
+            engine = load_search_engine(text_root, DEFAULT_ARTIFACT_DIR)
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+            st.stop()
+
+        hits = engine.search(query, top_k=top_k)
         if not hits:
             st.warning("No matching CTI records were found for this query. Put your .txt reports under the text corpus root and try again.")
             st.stop()
 
         selected = hits[0].document
-        model = load_or_train_model(model_dir, train_path, dev_path)
+        model = load_or_train_model(model_dir, train_path, dev_path, force_retrain=force_retrain)
         entities = parse_text_to_dict(model, selected.text)
 
     st.subheader("Top related records")
@@ -161,6 +125,6 @@ if st.button("Search and parse best match", type="primary"):
     if not entities:
         st.info("No entities were extracted from the selected CTI record.")
     else:
-        st.json(entities, expanded=False)
+        st.json(entities, expanded=True)
 else:
     st.info("Enter a query and click the button to search and parse the most relevant CTI record.")
